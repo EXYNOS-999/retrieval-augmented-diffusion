@@ -19,7 +19,7 @@ from ldm.util import load_model_from_config, set_seed, slugify
 sys.path.append("src/taming-transformers")
 warnings.filterwarnings("ignore")
 
-DEBUG = True
+DEBUG = False
 DATABASE_NAMES = [
     "cars",
     "coco",
