@@ -115,7 +115,7 @@ class Predictor(BasePredictor):
     def predict(
         self,
         prompts: str = Input(
-            default=None,
+            default="",
             description="(batched) Use up to 8 prompts by separating with a `|` character.",
         ),
         image_prompt: Path = Input(
@@ -180,7 +180,7 @@ class Predictor(BasePredictor):
             description="The eta parameter for ddim sampling.",
         ),
         negative_prompt: str = Input(
-            default=None,
+            default="",
             description="(experimental) Use this prompt as a negative prompt for the sampler.",
         ),
         seed: int = Input(
@@ -208,7 +208,7 @@ class Predictor(BasePredictor):
             print(
                 f"Using image as context: {image_prompt}, overriding any text prompts."
             )
-        elif prompts is not None and len(prompts.strip()) > 0:
+        elif len(prompts.strip()) > 0:
             clip_text_embed = self.clip_perceptor.encode_prompts(
                 prompts, normalize=True
             )
@@ -238,9 +238,7 @@ class Predictor(BasePredictor):
 
         assert model_context is not None, "Must provide either prompts or image_prompt"
 
-        if (
-            negative_prompt is not None
-        ):  # if a negative is provided, then we use the negative as the unconditional embed
+        if len(negative_prompt.strip()) > 0:
             negative_clip_embed = self.clip_perceptor.encode_prompts(
                 negative_prompt, normalize=True
             )
@@ -272,11 +270,9 @@ class Predictor(BasePredictor):
             pil_image.save(target_path, "png")
 
         prediction_output_paths = []
-        if prompts is not None:
-            if (
-                len(prompts) == decoded_generations.shape[0]
-            ):  # prompts are paired with the generated images
-                labeled_generations = zip(decoded_generations, prompts)
+        if len(prompts.strip()) > 0 and len(prompts) == decoded_generations.shape[0]:
+            # prompts are paired with the generated images
+            labeled_generations = zip(decoded_generations, prompts)
         else:  # prompts are not paired with the generated images, use blank strings for the prompts
             labeled_generations = zip(
                 decoded_generations, [""] * decoded_generations.shape[0]
@@ -293,6 +289,6 @@ class Predictor(BasePredictor):
             if DEBUG:
                 save_sample(generation, f"{generation_stub}_debug.png")
             prediction_output_paths.append(
-                CaptionedImage(caption=prompt, image=target_path)
+                CaptionedImage(caption=prompt.strip(), image=target_path)
             )
         return prediction_output_paths
