@@ -1,27 +1,25 @@
-import random
-import re
+from einops import repeat
 import sys
 import tempfile
 import warnings
-from typing import List
+from typing import List, Optional
 
 import numpy as np
 import torch
-from clip_retrieval.clip_back import load_index
-
 from cog import BaseModel, BasePredictor, Input, Path
 from einops import rearrange
 from omegaconf import OmegaConf
-from PIL import Image
+from PIL import Image as PILImage
 
+from ldm.knn_util import Perceptor, load_image_index_from_disk, sample_and_decode
 from ldm.models.diffusion.ddim import DDIMSampler
 from ldm.models.diffusion.plms import PLMSSampler
-from ldm.modules.encoders.modules import FrozenClipImageEmbedder, FrozenCLIPTextEmbedder
-from ldm.util import instantiate_from_config
+from ldm.util import load_model_from_config, set_seed, slugify
 
 sys.path.append("src/taming-transformers")
 warnings.filterwarnings("ignore")
 
+DEBUG = False
 DATABASE_NAMES = [
     "cars",
     "coco",
@@ -42,104 +40,93 @@ INIT_DATABASES = [
 PROMPT_UPPER_BOUND = 8
 
 
-def set_seed(seed):
-    if seed == -1:
-        seed = random.randint(0, 2**32 - 1)
-        print(f"Using random seed {seed}")
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    random.seed(seed)
-
-
 class CaptionedImage(BaseModel):
     image: Path
     caption: str
 
 
-def knn_search(query: torch.Tensor, num_results: int, image_index):
-    if query.dim() == 3:  # (b, 1, d)
-        query = query.squeeze(1)  # need to expand to (b, d)
-    query_embeddings = query.cpu().detach().numpy().astype(np.float32)
-    distances, indices, embeddings = image_index.search_and_reconstruct(
-        query_embeddings, num_results
-    )
-    return distances, indices, embeddings
-
-
-def load_model_from_config(config, ckpt, verbose=False):
-    pl_sd = torch.load(ckpt, map_location="cpu")
-    if "global_step" in pl_sd:
-        print(f"Global Step: {pl_sd['global_step']}")
-    sd = pl_sd["state_dict"]
-    model = instantiate_from_config(config.model)
-    m, u = model.load_state_dict(sd, strict=False)
-    if len(m) > 0 and verbose:
-        print("missing keys:")
-        print(m)
-    if len(u) > 0 and verbose:
-        print("unexpected keys:")
-        print(u)
-    model.eval()
-    print(f"Loaded model from {ckpt}")
-    return model
-
-
-def build_searcher(database_name: str):
-    image_index_path = Path(
-        "data", "rdm", "faiss_indices", database_name, "image.index"
-    )
-    assert image_index_path.exists(), f"database at {image_index_path} does not exist"
-    print(f"Loading semantic index from {image_index_path}")
-    return {
-        "image_index": load_index(
-            str(image_index_path), enable_faiss_memory_mapping=True
-        )
-    }
-
-
-def slugify(value):
+def create_unconditional_embed(
+    model_context: torch.Tensor,
+    negative_clip_embed: Optional[torch.Tensor] = None,
+) -> torch.Tensor:  # (batch_size, num_results, 768)
     """
-    Normalizes string, converts to lowercase, removes non-alpha characters,
-    and converts spaces to hyphens.
+    Create an unconditional embedding for the given model context.
+
+    Args:
+        model_context: The model context to use.
+        device: The device to use.
+        negative_clip_embed: A CLIP text embedding to use as the negative conditioning. Otherwise uses zeros.
     """
-    value = re.sub(r"[^\w\s-]", "", value).strip().lower()
-    return re.sub(r"[-\s]+", "-", value)
+    if (
+        negative_clip_embed
+    ):  # if a negative is provided, then we use the negative as the unconditional embed
+        return negative_clip_embed.expand_as(model_context)
+    else:
+        return torch.zeros_like(
+            model_context
+        )  # by default, the unconditional embed is all zeros
 
 
 class Predictor(BasePredictor):
-    def __init__(self):
-        self.searchers = None
-
     @torch.inference_mode()
     def setup(self):
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = True
-        self.device = (
-            torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-        )
+        self.device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
         config = OmegaConf.load(f"configs/retrieval-augmented-diffusion/768x768.yaml")
-        model = load_model_from_config(config, f"models/rdm/rdm768x768/model.ckpt")
-        self.model = model.to(self.device)
-        print(f"Loaded 1.4M param Retrieval Augmented Diffusion model to {self.device}")
+        model: torch.nn.Module = load_model_from_config(config, f"models/rdm/rdm768x768/model.ckpt")  # type: ignore
+        self.rdm_model = model.to(self.device)
+        print("Loaded 1.4M param Retrieval Augmented Diffusion model.")
 
-        self.clip_text_model = FrozenCLIPTextEmbedder(device="cpu")
-        print(f"Loaded Frozen CLIP Text Embedder to cpu")
+        self.clip_perceptor = Perceptor(self.device)
 
-        self.searchers = {
-            database_name: build_searcher(database_name)
+        self.image_indices = {
+            database_name: load_image_index_from_disk(database_name)
             for database_name in INIT_DATABASES
         }
         print(f"Loaded searchers for {INIT_DATABASES}")
 
         self.output_directory = Path(tempfile.mkdtemp())
 
+    def faiss_lookup(
+        self,
+        query_embedding: torch.Tensor,
+        database_name: str,
+        num_database_results: int,
+    ) -> torch.Tensor:
+        """
+        Lookup the nearest neighbors in the given database.
+        """
+        current_image_index = self.image_indices[database_name]
+        if query_embedding.ndim == 3:  # (b, 1, d)
+            query_embedding = query_embedding.squeeze(
+                1
+            )  # need to reduce to (b, d) for faiss
+        query_embeddings = query_embedding.cpu().detach().numpy().astype(np.float32)
+        _, _, result_embeddings = current_image_index.search_and_reconstruct(
+            query_embeddings, num_database_results
+        )
+        result_embeddings = torch.from_numpy(result_embeddings).to(self.device)
+        print(
+            f"Ran query w/ shape: {query_embedding.shape} in database: {database_name}"
+        )
+        return result_embeddings
+
     @torch.inference_mode()
     def predict(
         self,
         prompts: str = Input(
-            default="",
+            default=None,
             description="(batched) Use up to 8 prompts by separating with a `|` character.",
+        ),
+        image_prompt: Path = Input(
+            default=None,
+            description="(overrides `prompts`) Use an image as the prompt to generate variations of an existing image.",
+        ),
+        number_of_variations: int = Input(
+            default=4,
+            description="Number of variations to generate when using only one `text_prompt`, or an `image_prompt`.",
+            ge=1,
+            le=8,
         ),
         database_name: str = Input(
             default="laion-aesthetic",
@@ -158,13 +145,13 @@ class Predictor(BasePredictor):
                 "food",
             ],
         ),
+        use_database: bool = Input(
+            default=True,
+            description="Whether to use the database for the semantic search.",
+        ),
         scale: float = Input(
             default=5.0,
             description="Classifier-free unconditional scale for the sampler.",
-        ),
-        use_database: bool = Input(
-            default=True,
-            description="Disable to condition solely on the prompt without using retrieval-augmentation.",
         ),
         num_database_results: int = Input(
             default=10,
@@ -173,10 +160,12 @@ class Predictor(BasePredictor):
             le=20,
         ),
         height: int = Input(
-            default=768, description="Desired height of generated images."
+            default=768,
+            description="Desired width of generated images. Values beside 768 are likely to cause zooming issues.",
         ),
         width: int = Input(
-            default=768, description="Desired width of generated images."
+            default=768,
+            description="Desired width of generated images. Values beside 768 are not supported, likely to cause artifacts.",
         ),
         steps: int = Input(
             default=50,
@@ -190,90 +179,119 @@ class Predictor(BasePredictor):
             default=0.0,
             description="The eta parameter for ddim sampling.",
         ),
+        negative_prompt: str = Input(
+            default=None,
+            description="(experimental) Use this prompt as a negative prompt for the sampler.",
+        ),
         seed: int = Input(
             default=-1,
             description="Seed for the random number generator. Set to -1 to use a random seed.",
         ),
     ) -> List[CaptionedImage]:
-        if len(prompts.strip()) == 0:
-            raise ValueError("No prompts provided")
-        
-        prompts = prompts.split("|")
-        if len(prompts) > PROMPT_UPPER_BOUND:
-            raise ValueError("You can only use up to 8 prompts. Try again using fewer `|` separators. Make sure to remove `|` characters from your captions if they are present.")
-        print(f"Prompts: {prompts}")
-
         set_seed(seed)
         print(f"Seed: {seed}")
 
-        clip_text_embed = self.clip_text_model.encode(prompts)
-        print(f"CLIP Text Embed: {clip_text_embed.shape}")
+        if database_name not in self.image_indices:
+            print(f"Loading database: {database_name}. May take a while...")
+            self.image_indices[database_name] = load_image_index_from_disk(
+                database_name
+            )
 
-        if ddim_sampling:
-            print("Using ddim sampling")
-            sampler = DDIMSampler(self.model)
+        if image_prompt is not None:
+            clip_image_embed = self.clip_perceptor.encode_image(
+                image_prompt, normalize=True
+            )
+            clip_image_embed = repeat(
+                clip_image_embed, "1 k d -> b k d", b=number_of_variations
+            )
+            model_context = clip_image_embed
+            print(
+                f"Using image as context: {image_prompt}, overriding any text prompts."
+            )
+        elif prompts is not None and len(prompts.strip()) > 0:
+            clip_text_embed = self.clip_perceptor.encode_prompts(
+                prompts, normalize=True
+            )
+            if clip_text_embed.shape[0] == 1:
+                print(f"Only one prompt, repeating it {number_of_variations} times.")
+                clip_text_embed = repeat(
+                    clip_text_embed, "1 k d -> b k d", b=number_of_variations
+                )
+
+            if use_database:
+                result_embeddings = self.faiss_lookup(
+                    clip_text_embed, database_name, num_database_results
+                )
+                model_context = torch.cat(
+                    [
+                        clip_text_embed.to(self.device),
+                        result_embeddings.to(self.device),
+                    ],
+                    dim=1,
+                )
+                print(
+                    f"Using text as context: {prompts} (and {num_database_results} results from {database_name})"
+                )
+            else:
+                model_context = clip_text_embed
+                print(f"Using text as context: {prompts}. Database not being used.")
+
+        assert model_context is not None, "Must provide either prompts or image_prompt"
+
+        if (
+            negative_prompt is not None
+        ):  # if a negative is provided, then we use the negative as the unconditional embed
+            negative_clip_embed = self.clip_perceptor.encode_prompts(
+                negative_prompt, normalize=True
+            )
+            negative_clip_embed = negative_clip_embed.expand_as(model_context)
+            print(f"(caution, experimental): Using negative prompt: {negative_prompt}")
         else:
-            print("Using plms sampling")
-            sampler = PLMSSampler(self.model)
+            negative_clip_embed = torch.zeros_like(
+                model_context
+            )  # by default, the unconditional embed is all zeros
 
-        if use_database:
-            if database_name not in self.searchers:  # Load any new searchers
-                self.searchers[database_name] = build_searcher(database_name)
-
-            _, _, result_embeddings = knn_search(
-                query=clip_text_embed,
-                num_results=num_database_results,
-                image_index=self.searchers[database_name]["image_index"],
-            )
-            result_embeddings = torch.from_numpy(result_embeddings).to(
-                self.device
-            )  # the input to the model is the result embeddings
-            model_context = torch.cat(
-                [clip_text_embed.to(self.device), result_embeddings.to(self.device)],
-                dim=1,
-            )
-        else:
-            print(f"warning: Using prompt only without any input from the database")
-            model_context = clip_text_embed.to(self.device)
-
-        unconditional_clip_embed = None
-        if scale != 1.0:
-            unconditional_clip_embed = torch.zeros_like(model_context)
-
-        with self.model.ema_scope():
-            shape = [
-                16,
-                height // 16,
-                width // 16,
-            ]  # note: currently hardcoded for f16 model
-            samples, _ = sampler.sample(
-                S=steps,
-                conditioning=model_context,
-                batch_size=model_context.shape[0],
-                shape=shape,
-                verbose=False,
-                unconditional_guidance_scale=scale,
-                unconditional_conditioning=unconditional_clip_embed,
-                eta=ddim_eta,
-            )
-            decoded_generations = self.model.decode_first_stage(samples)
-            decoded_generations = torch.clamp(
-                (decoded_generations + 1.0) / 2.0, min=0.0, max=1.0
+        with torch.cuda.amp.autocast(enabled=self.device.startswith("cuda")):
+            decoded_generations = sample_and_decode(
+                rdm_model=self.rdm_model,
+                sampler=DDIMSampler(self.rdm_model)
+                if ddim_sampling
+                else PLMSSampler(self.rdm_model),
+                model_context=model_context,
+                steps=steps,
+                scale=scale,
+                ddim_eta=ddim_eta,
+                unconditional_conditioning=negative_clip_embed,
+                height=height,
+                width=width,
             )
 
-            generation_paths = []
-            captioned_generations = zip(decoded_generations, prompts)
-            for idx, (generation, prompt) in enumerate(captioned_generations):
-                generation = 255.0 * rearrange(
-                    generation.cpu().numpy(), "c h w -> h w c"
-                )
-                generation_stub = f"sample_{idx:03d}__{slugify(prompt)}"
-                x_sample_target_path = self.output_directory.joinpath(
-                    f"{generation_stub}.png"
-                )
-                pil_image = Image.fromarray(generation.astype(np.uint8))
-                pil_image.save(x_sample_target_path, "png")
-                generation_paths.append(
-                    CaptionedImage(caption=prompt, image=x_sample_target_path)
-                )
-            return generation_paths
+        def save_sample(generation, target_path):
+            generation = 255.0 * rearrange(generation.cpu().numpy(), "c h w -> h w c")
+            pil_image = PILImage.fromarray(generation.astype(np.uint8))
+            pil_image.save(target_path, "png")
+
+        prediction_output_paths = []
+        if (
+            len(prompts) == decoded_generations.shape[0]
+        ):  # prompts are paired with the generated images
+            labeled_generations = zip(decoded_generations, prompts)
+        else:  # prompts are not paired with the generated images, use blank strings for the prompts
+            labeled_generations = zip(
+                decoded_generations, [""] * decoded_generations.shape[0]
+            )
+
+        for idx, (generation, prompt) in enumerate(labeled_generations):
+            generation_stub = (
+                f"sample_{idx:03d}__{slugify(prompt)}"
+                if len(prompt) > 0
+                else f"sample_{idx:03d}"
+            )
+            target_path = self.output_directory / f"{generation_stub}.png"
+            save_sample(generation, target_path)
+            if DEBUG:
+                save_sample(generation, f"{generation_stub}_debug.png")
+            prediction_output_paths.append(
+                CaptionedImage(caption=prompt, image=target_path)
+            )
+        return prediction_output_paths

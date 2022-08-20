@@ -71,7 +71,7 @@ Run this mode via
 python scripts/knn2img.py  --prompt "a happy bear reading a newspaper, oil on canvas"
 ```
 
-#### RDM with text-to-image retrieval
+#### RDM with text-to-image retrieval using ScaNN
 
 To be able to run a RDM conditioned on a text-prompt and additionally images retrieved from this prompt, you will also need to download the corresponding retrieval database. 
 We provide two distinct databases extracted from the [Openimages-](https://storage.googleapis.com/openimages/web/index.html) and [ArtBench-](https://github.com/liaopeiyuan/artbench) datasets. 
@@ -106,6 +106,45 @@ Note that the maximum supported number of neighbors is 20.
 The database can be changed via the cmd parameter ``--database`` which can be `[openimages, artbench-art_nouveau, artbench-baroque, artbench-expressionism, artbench-impressionism, artbench-post_impressionism, artbench-realism, artbench-renaissance, artbench-romanticism, artbench-surrealism, artbench-ukiyo_e]`.
 For using `--database openimages`, the above script (`scripts/train_searcher.py`) must be executed before.
 Due to their relatively small size, the artbench datasetbases are best suited for creating more abstract concepts and do not work well for detailed text control. 
+
+### RDM with image-text retrieval using faiss indices (WIP)
+
+```sh
+pip install clip-retrieval
+```
+
+Embed your dataset with CLIP ViT-L/14
+
+```sh
+clip-retrieval inference \
+    --input_dataset "my_dataset" \
+    --output_folder "my_embeddings" \
+    --input_format files \
+    --num_prepro_workers 12 \
+    --enable_image True \
+    --enable_text False \
+    --enable_metadata False \
+    --clip_model "ViT-L/14" \
+    --use_jit False
+```
+
+Create a faiss index from your embeddings
+
+```sh
+clip-retrieval index \
+        "my_embeddings" \
+        "my_index" \
+        --max_index_memory_usage=4G \
+        --current_memory_available=16G \
+        --nb_cores 12                                                                                                                                                                               
+```
+
+Move your index into the data folder:
+
+```sh
+mkdir -p data/searchers/faiss_indices
+mv -n -v my_index data/searchers/faiss_indices/
+```
 
 
 #### Coming Soon
