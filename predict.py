@@ -272,10 +272,11 @@ class Predictor(BasePredictor):
             pil_image.save(target_path, "png")
 
         prediction_output_paths = []
-        if (
-            len(prompts) == decoded_generations.shape[0]
-        ):  # prompts are paired with the generated images
-            labeled_generations = zip(decoded_generations, prompts)
+        if prompts is not None:
+            if (
+                len(prompts) == decoded_generations.shape[0]
+            ):  # prompts are paired with the generated images
+                labeled_generations = zip(decoded_generations, prompts)
         else:  # prompts are not paired with the generated images, use blank strings for the prompts
             labeled_generations = zip(
                 decoded_generations, [""] * decoded_generations.shape[0]
